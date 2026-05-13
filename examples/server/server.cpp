@@ -87,7 +87,7 @@ struct whisper_params {
     float logprob_thold   = -1.00f;
     float temperature     =  0.00f;
     float temperature_inc =  0.20f;
-    float no_speech_thold = 0.6f;
+    float no_speech_thold =  0.6f;
 
     bool debug_mode      = false;
     bool translate       = false;
@@ -527,6 +527,10 @@ void get_req_parameters(const Request & req, whisper_params & params)
     {
         params.logprob_thold = std::stof(req.get_file_value("logprob_thold").content);
     }
+    if (req.has_file("no_speech_thold"))
+    {
+        params.no_speech_thold = std::stof(req.get_file_value("no_speech_thold").content);
+    }
     if (req.has_file("debug_mode"))
     {
         params.debug_mode = parse_str_to_bool(req.get_file_value("debug_mode").content);
@@ -762,6 +766,7 @@ int main(int argc, char ** argv) {
     -F file="@&lt;file-path&gt;" \
     -F temperature="0.0" \
     -F temperature_inc="0.2" \
+    -F no_speech_thold="0.6" \
     -F response_format="json"
         </pre>
 
@@ -940,7 +945,7 @@ int main(int argc, char ** argv) {
             wparams.beam_search.beam_size = params.beam_size;
 
             wparams.temperature      = params.temperature;
-            wparams.no_speech_thold = params.no_speech_thold;
+            wparams.no_speech_thold  = params.no_speech_thold;
             wparams.temperature_inc  = params.temperature_inc;
             wparams.entropy_thold    = params.entropy_thold;
             wparams.logprob_thold    = params.logprob_thold;
