@@ -1501,7 +1501,7 @@ jobs:
         id: ggml-ci
         run: |
           nvidia-smi
-          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/whisper.cpp /mnt/whisper.cpp
+          GG_BUILD_CUDA=1 bash ./ci/run.sh ~/results/whisper.cpp ~/mnt/whisper.cpp
 
   ggml-ci-x64-nvidia-vulkan-cm:
     runs-on: [self-hosted, Linux, NVIDIA]
@@ -1515,7 +1515,7 @@ jobs:
         id: ggml-ci
         run: |
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/whisper.cpp /mnt/whisper.cpp
+          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/whisper.cpp ~/mnt/whisper.cpp
 
   ggml-ci-x64-nvidia-vulkan-cm2:
     runs-on: [self-hosted, Linux, NVIDIA, COOPMAT2]
@@ -1529,7 +1529,7 @@ jobs:
         id: ggml-ci
         run: |
           vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/whisper.cpp /mnt/whisper.cpp
+          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/whisper.cpp ~/mnt/whisper.cpp
 
   #ggml-ci-x64-cpu-amx:
   #  runs-on: [self-hosted, Linux, X64, CPU, AMX]
@@ -1542,7 +1542,7 @@ jobs:
   #    - name: Test
   #      id: ggml-ci
   #      run: |
-  #        bash ./ci/run.sh ~/results/whisper.cpp /mnt/whisper.cpp
+  #        bash ./ci/run.sh ~/results/whisper.cpp ~/mnt/whisper.cpp
 
   ggml-ci-mac-metal:
     runs-on: [self-hosted, macOS, ARM64]
