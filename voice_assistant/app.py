@@ -48,6 +48,7 @@ RECORDING_PATH     = "/tmp/va_ui_recording.wav"
 TRANSCRIPT_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation.txt")
 MAX_RECORD_SECONDS = 30
 EAGER_SILENCE      = 0.6   # start speculative transcription after this much quiet
+LIVE_ASR_INTERVAL  = 3.0   # preview long user turns using server-only snapshots
 COMMIT_SILENCE     = 1.8   # stop listening after this much quiet — raise if cut off
 EXTENDED_SILENCE   = 4.0   # ...but wait longer when the transcript sounds unfinished
 MIN_SPEECH_SECONDS = 0.4   # your turn does not end until this much *speech* was heard
@@ -86,6 +87,7 @@ _status        = "Idle"
 _session       = None
 _loop_thread   = None
 _pending_start = None  # None, fresh conversation (True), or resume (False)
+_live_turn     = None  # visible, uncommitted transcript for the current session
 _whisper_mdl   = None
 _piper_voice   = None
 _tts_rate      = None
@@ -114,10 +116,40 @@ def _trim_history():
         del _chat_history[:len(_chat_history) - max_msgs]
 
 
-def _append_transcript(user_text: str, assistant_text: str):
+def _set_live_turn(session: _Session, user_text: str, *, provisional=False):
+    global _live_turn
+    with _lock:
+        if _session is session and not session.stop.is_set():
+            previous = _live_turn if _live_turn and _live_turn["session"] is session else None
+            _live_turn = {
+                "session": session,
+                "user": user_text,
+                "assistant": previous["assistant"] if previous else "",
+                "provisional": provisional,
+            }
+
+
+def _append_live_assistant(session: _Session, token: str):
+    with _lock:
+        if _live_turn and _live_turn["session"] is session and not session.stop.is_set():
+            _live_turn["assistant"] += token
+
+
+def _clear_live_turn(session: _Session):
+    global _live_turn
+    with _lock:
+        if _live_turn and _live_turn["session"] is session:
+            _live_turn = None
+
+
+def _append_transcript(session: _Session, user_text: str, assistant_text: str):
+    global _live_turn
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    with open(TRANSCRIPT_PATH, "a", encoding="utf-8") as f:
-        f.write(f"[{ts}]\nYou: {user_text}\n\nAssistant: {assistant_text}\n{'-'*60}\n\n")
+    with _lock:
+        with open(TRANSCRIPT_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{ts}]\nYou: {user_text}\n\nAssistant: {assistant_text}\n{'-'*60}\n\n")
+        if _live_turn and _live_turn["session"] is session:
+            _live_turn = None
 
 
 def _get_whisper_device():
@@ -217,16 +249,20 @@ def _listen_and_transcribe(session: _Session) -> tuple:
     extended_chunks = int(EXTENDED_SILENCE / 0.1)
     min_speech   = int(MIN_SPEECH_SECONDS / 0.1)
     max_chunks   = int(MAX_RECORD_SECONDS / 0.1)
+    preview_chunks = int(LIVE_ASR_INTERVAL / 0.1)
     window_samps = int(SAMPLE_RATE * VAD_WINDOW_SECONDS)
 
+    _clear_live_turn(session)
     _set_status(session, "Listening — speak now")
     recorded, silence_count, speech_chunks = [], 0, 0
-    pending, speculated = None, False
+    pending, preview, speculated = None, None, False
+    shown_samples = 0
 
-    def _spawn(audio: np.ndarray):
+    def _spawn(audio: np.ndarray, *, preview_only=False):
         """Transcribe one immutable snapshot; abandoned workers own no session state."""
         snap      = audio.copy()
-        result = {"done": threading.Event(), "text": "", "error": None}
+        result = {"done": threading.Event(), "text": "", "error": None,
+                  "samples": len(snap), "published": False}
 
         def work():
             snap_path = None
@@ -234,7 +270,8 @@ def _listen_and_transcribe(session: _Session) -> tuple:
                 fd, snap_path = tempfile.mkstemp(prefix="va_recording_", suffix=".wav")
                 os.close(fd)
                 _wavfile.write(snap_path, SAMPLE_RATE, snap)
-                result["text"] = _transcribe(snap_path)
+                result["text"] = (_transcribe_via_server(snap_path) if preview_only
+                                  else _transcribe(snap_path))
             except Exception as exc:
                 result["error"] = exc
             finally:
@@ -284,14 +321,32 @@ def _listen_and_transcribe(session: _Session) -> tuple:
             tail   = (tail[-window_samps:] / 32768.0)
             speech = _is_speech(vad, tail)
 
+            # A resumed sentence invalidates the pause snapshot, but a preview
+            # of the continuous utterance is still useful while recording.
+            if speech and speculated:
+                pending, speculated = None, False
+                _set_status(session, "Still listening…")
+            for task in (preview, pending):
+                if task and task["done"].is_set() and not task["published"]:
+                    task["published"] = True
+                    guess = task["text"]
+                    if (not task["error"] and guess and
+                            not _is_noise_transcript(guess) and
+                            task["samples"] > shown_samples):
+                        shown_samples = task["samples"]
+                        _set_live_turn(session, guess, provisional=True)
+
             if i < warmup_chunks:
                 continue
 
             if speech:
                 speech_chunks += 1
-                if speculated:
-                    _set_status(session, "Still listening…")
-                silence_count, pending, speculated = 0, None, False
+                silence_count = 0
+                if (speech_chunks >= min_speech and i > 0 and
+                        i % preview_chunks == 0 and
+                        (preview is None or preview["done"].is_set())):
+                    preview = _spawn(np.concatenate(recorded, axis=0).reshape(-1),
+                                     preview_only=True)
                 continue
 
             # Nothing said yet — this is not a pause, you simply have not started.
@@ -614,9 +669,11 @@ def _run_loop(session: _Session):
             text = cleaned
 
             if not text:
+                _clear_live_turn(session)
                 _set_status(session, "Nothing heard — listening again")
                 continue
 
+            _set_live_turn(session, text)
             _set_status(session, f"You: {text[:70]}{'…' if len(text) > 70 else ''}")
 
             # LLM + TTS
@@ -633,6 +690,7 @@ def _run_loop(session: _Session):
                     for token in _ollama_tokens(session, text):
                         if session.stop.is_set():
                             break
+                        _append_live_assistant(session, token)
                         tts_buf += token
                         while True:
                             m = _SENTENCE_END.search(tts_buf)
@@ -674,9 +732,10 @@ def _run_loop(session: _Session):
                         session.stop.wait(ECHO_SETTLE_SECONDS)
                 else:
                     _set_status(session, "Thinking…")
-                    for _ in _ollama_tokens(session, text):
+                    for token in _ollama_tokens(session, text):
                         if session.stop.is_set():
                             break
+                        _append_live_assistant(session, token)
 
                 if session.stop.is_set():
                     if _chat_history and _chat_history[-1]["role"] == "user":
@@ -695,7 +754,7 @@ def _run_loop(session: _Session):
                 session.player = None
 
                 if _chat_history and _chat_history[-1]["role"] == "assistant":
-                    _append_transcript(text, _chat_history[-1]["content"])
+                    _append_transcript(session, text, _chat_history[-1]["content"])
 
             except Exception as exc:
                 session.tts_abort.set()
@@ -719,9 +778,10 @@ def _run_loop(session: _Session):
 
 def _launch_locked(clear_history: bool):
     """Start a session while holding _lock; only called after the old one exits."""
-    global _session, _loop_thread, _status
+    global _session, _loop_thread, _status, _live_turn
     if clear_history:
         _chat_history.clear()
+    _live_turn = None
     session = _Session()
     _session = session
     _status = "Starting…"
@@ -730,10 +790,12 @@ def _launch_locked(clear_history: bool):
 
 
 def _finish_session(session: _Session):
-    global _session, _status, _pending_start
+    global _session, _status, _pending_start, _live_turn
     with _lock:
         if _session is not session:
             return
+        if _live_turn and _live_turn["session"] is session:
+            _live_turn = None
         _session = None
         requested = _pending_start
         _pending_start = None
@@ -834,10 +896,18 @@ def ui_get_status():
 
 
 def ui_get_transcript():
-    if not os.path.exists(TRANSCRIPT_PATH):
-        return "(no transcript yet)"
-    with open(TRANSCRIPT_PATH, encoding="utf-8") as f:
-        return f.read()
+    with _lock:
+        if os.path.exists(TRANSCRIPT_PATH):
+            with open(TRANSCRIPT_PATH, encoding="utf-8") as f:
+                saved = f.read()
+        else:
+            saved = ""
+        turn = dict(_live_turn) if _live_turn else None
+    if turn:
+        label = "You (recognizing…)" if turn["provisional"] else "You"
+        live = f"{label}: {turn['user']}\n\nAssistant: {turn['assistant']}"
+        return saved + live
+    return saved or "(no transcript yet)"
 
 
 def ui_export_transcript():
@@ -846,9 +916,12 @@ def ui_export_transcript():
 
 def ui_clear_conversation():
     """Clear in-memory chat history and the transcript file."""
-    _chat_history.clear()
-    if os.path.exists(TRANSCRIPT_PATH):
-        os.remove(TRANSCRIPT_PATH)
+    global _live_turn
+    with _lock:
+        _chat_history.clear()
+        _live_turn = None
+        if os.path.exists(TRANSCRIPT_PATH):
+            os.remove(TRANSCRIPT_PATH)
     return "(no transcript yet)"
 
 # ── Build UI ───────────────────────────────────────────────────────────────────
@@ -907,11 +980,12 @@ with gr.Blocks(title="Voice Assistant") as demo:
 
     export_btn.click(_do_export, outputs=[file_output])
 
-    # Auto-refresh every 2 s
+    # Response tokens reach the transcript without waiting for speech playback.
     timer = gr.Timer(2)
     timer.tick(ui_get_status,      outputs=[status_box])
     timer.tick(_button_state,       outputs=[toggle_btn])
-    timer.tick(ui_get_transcript,  outputs=[transcript_box])
+    transcript_timer = gr.Timer(0.5)
+    transcript_timer.tick(ui_get_transcript, outputs=[transcript_box])
 
 
 if __name__ == "__main__":

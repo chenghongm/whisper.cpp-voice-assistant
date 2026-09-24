@@ -209,6 +209,14 @@ Two things to watch for when tuning further:
 | **Resume** | Restarts the loop **keeping** the context it already had |
 | **Clear Conversation** | Wipes the in-memory history and the transcript file |
 
+The transcript box refreshes every 0.5 s. A completed user utterance appears as
+soon as recognition finishes, and the assistant's text appears as Ollama tokens
+arrive, while speech is still playing. During long utterances, the whisper.cpp
+server can provide a provisional snapshot about every 3 s; it is labeled
+"recognizing" and may change when the turn ends. Without the server, the local
+fallback still recognizes the completed turn, but has no during-speech preview.
+Only completed exchanges are saved to `conversation.txt` for export.
+
 Stop signals the current session immediately. Start or Resume requested while it
 is stopping begins automatically after the old session releases its microphone
 and speaker. A stalled audio device can still delay that release.

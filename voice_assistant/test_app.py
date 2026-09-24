@@ -1,5 +1,7 @@
-"""Cancellation tests that do not need audio devices or local model servers."""
+"""Conversation tests that do not need audio devices or local model servers."""
 
+import os
+import tempfile
 import threading
 import time
 import unittest
@@ -16,12 +18,125 @@ class SessionCancellationTests(unittest.TestCase):
             self.assertIsNone(app._session)
             app._pending_start = None
             app._chat_history.clear()
+            app._live_turn = None
 
     def tearDown(self):
         with app._lock:
             self.assertIsNone(app._session)
             app._pending_start = None
             app._chat_history.clear()
+            app._live_turn = None
+
+    def test_transcript_updates_before_the_reply_finishes(self):
+        session = app._Session()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app, "TRANSCRIPT_PATH", os.path.join(directory, "conversation.txt")):
+            with app._lock:
+                app._session = session
+            try:
+                app._set_live_turn(session, "the user's answer")
+                self.assertIn("You: the user's answer", app.ui_get_transcript())
+                app._append_live_assistant(session, "First ")
+                self.assertIn("Assistant: First ", app.ui_get_transcript())
+                app._append_live_assistant(session, "sentence.")
+                app._append_transcript(session, "the user's answer", "First sentence.")
+                rendered = app.ui_get_transcript()
+                self.assertEqual(rendered.count("You: the user's answer"), 1)
+                self.assertIn("Assistant: First sentence.", rendered)
+            finally:
+                with app._lock:
+                    app._session = None
+
+    def test_reply_is_visible_while_ollama_is_still_streaming(self):
+        session = app._Session()
+        first_token_seen = threading.Event()
+        release = threading.Event()
+        turns = 0
+
+        def listen(_session):
+            nonlocal turns
+            turns += 1
+            if turns == 1:
+                return "hello there", 1, 0
+            session.stop.wait(2)
+            return "", 0, 0
+
+        def tokens(_session, _text):
+            app._chat_history.append({"role": "user", "content": "hello there"})
+            yield "First "
+            first_token_seen.set()
+            release.wait(2)
+            yield "sentence."
+            app._chat_history.append({"role": "assistant", "content": "First sentence."})
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app, "TRANSCRIPT_PATH", os.path.join(directory, "conversation.txt")), \
+             patch.object(app, "_load_models"), \
+             patch.object(app, "_listen_and_transcribe", side_effect=listen), \
+             patch.object(app, "_ollama_tokens", side_effect=tokens), \
+             patch.object(app, "_piper_voice", None):
+            with app._lock:
+                app._session = session
+            loop = threading.Thread(target=app._run_loop, args=(session,), daemon=True)
+            try:
+                loop.start()
+                self.assertTrue(first_token_seen.wait(1))
+                self.assertIn("Assistant: First ", app.ui_get_transcript())
+                self.assertFalse(os.path.exists(app.TRANSCRIPT_PATH))
+                release.set()
+                deadline = time.monotonic() + 1
+                while not os.path.exists(app.TRANSCRIPT_PATH):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                self.assertIn("Assistant: First sentence.", app.ui_get_transcript())
+            finally:
+                release.set()
+                session.stop.set()
+                loop.join(timeout=1)
+
+    def test_long_speech_shows_server_preview_before_turn_end(self):
+        session = app._Session()
+        chunk = np.ones((1600, 1), dtype=np.int16)
+
+        class InputStream:
+            def __init__(self, *, callback, **_kwargs):
+                self.callback = callback
+
+            def __enter__(self):
+                def feed():
+                    for _ in range(60):
+                        self.callback(chunk, len(chunk), None, None)
+                        time.sleep(0.005)
+
+                self.producer = threading.Thread(target=feed, daemon=True)
+                self.producer.start()
+                return self
+
+            def __exit__(self, *_args):
+                self.producer.join(timeout=1)
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(app, "TRANSCRIPT_PATH", os.path.join(directory, "conversation.txt")), \
+             patch.object(app.sd, "InputStream", InputStream), \
+             patch.object(app, "_get_vad", return_value=None), \
+             patch.object(app, "_is_speech", return_value=True), \
+             patch.object(app, "_transcribe_via_server", return_value="partial answer"):
+            with app._lock:
+                app._session = session
+            listener = threading.Thread(
+                target=lambda: app._listen_and_transcribe(session), daemon=True
+            )
+            try:
+                listener.start()
+                deadline = time.monotonic() + 2
+                while "You (recognizing…): partial answer" not in app.ui_get_transcript():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+            finally:
+                session.stop.set()
+                listener.join(timeout=1)
+                with app._lock:
+                    app._session = None
 
     def test_stop_does_not_wait_for_response_close(self):
         release = threading.Event()
