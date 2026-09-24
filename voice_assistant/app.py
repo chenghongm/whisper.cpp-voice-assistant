@@ -31,18 +31,28 @@ import gradio as gr
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 SAMPLE_RATE        = 16_000
-WHISPER_MODEL_SIZE = "distil-large-v3"
+# STT: whisper.cpp server (CoreML/Metal) first, in-process faster-whisper as fallback.
+WHISPER_SERVER_URL     = "http://localhost:8178/inference"
+WHISPER_SERVER_TIMEOUT = 30
+WHISPER_MODEL_SIZE = "distil-large-v3"   # fallback only (CPU int8, ~3x slower)
 WHISPER_LANGUAGE   = "en"
 OLLAMA_CHAT_URL    = "http://localhost:11434/api/chat"
 OLLAMA_MODEL       = "gemma4"
+OLLAMA_THINK       = False   # gemma4 is a reasoning model; thinking costs ~13 s of TTFT
+OLLAMA_KEEP_ALIVE  = "30m"   # keep weights resident; a cold reload costs ~10 s
+OLLAMA_NUM_PREDICT = 200
 MAX_HISTORY_TURNS  = 10
 PIPER_MODEL        = os.path.expanduser("~/piper_models/en_US-lessac-medium.onnx")
 RECORDING_PATH     = "/tmp/va_ui_recording.wav"
 TRANSCRIPT_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversation.txt")
-MAX_RECORD_SECONDS = 20
-SILENCE_THRESHOLD  = 300
-SILENCE_DURATION   = 2.0
-MIN_SPEECH_SECONDS = 0.5
+MAX_RECORD_SECONDS = 30
+EAGER_SILENCE      = 0.6   # start speculative transcription after this much quiet
+COMMIT_SILENCE     = 1.8   # stop listening after this much quiet — raise if cut off
+EXTENDED_SILENCE   = 4.0   # ...but wait longer when the transcript sounds unfinished
+MIN_SPEECH_SECONDS = 0.4   # your turn does not end until this much *speech* was heard
+VAD_THRESHOLD      = 0.45  # Silero speech probability; lower = more sensitive
+VAD_WINDOW_SECONDS = 1.5
+SILENCE_THRESHOLD  = 300   # RMS fallback, used only if Silero fails to load
 TTS_LENGTH_SCALE   = 1.2
 MAX_TTS_CHARS      = 80
 
@@ -96,34 +106,229 @@ def _get_whisper_device():
     return "cpu", "int8"
 
 
-def _record_with_vad():
-    chunk_frames       = int(SAMPLE_RATE * 0.1)
-    silence_chunks_max = int(SILENCE_DURATION / 0.1)
-    min_chunks         = int(MIN_SPEECH_SECONDS / 0.1)
-    max_chunks         = int(MAX_RECORD_SECONDS / 0.1)
-    recorded, silence_count = [], 0
+_vad_model = None
+
+
+def _get_vad():
+    """Load Silero VAD once. Returns None if unavailable (caller falls back to RMS)."""
+    global _vad_model
+    if _vad_model is None:
+        try:
+            from faster_whisper.vad import get_vad_model
+            _vad_model = get_vad_model()
+        except Exception as exc:
+            print(f"  [Silero VAD unavailable, using RMS gate: {exc}]")
+            _vad_model = False
+    return _vad_model or None
+
+
+def _is_speech(vad, tail: np.ndarray) -> bool:
+    """
+    True if the most recent audio looks like speech. Silero wants frames of 512
+    samples, so the rolling window is trimmed to a multiple of that; the last few
+    frames (~100 ms) decide, while the earlier ones only supply context.
+    """
+    if vad is None:
+        rms = float(np.sqrt(np.mean(tail[-1600:].astype(np.float32) ** 2))) * 32768
+        return rms >= SILENCE_THRESHOLD
+    n = (len(tail) // 512) * 512
+    if n < 512:
+        return True
+    probs = np.asarray(vad(tail[-n:].astype(np.float32)))
+    return float(probs[-3:].max()) >= VAD_THRESHOLD
+
+
+# Words that almost never end a finished thought. If the provisional transcript
+# trails off on one of these, you were probably still mid-sentence when you paused.
+_HANGING_WORDS = {
+    "and", "or", "but", "so", "because", "if", "when", "while", "that", "which",
+    "the", "a", "an", "to", "of", "for", "with", "in", "on", "at", "is", "are",
+    "was", "were", "then", "like", "um", "uh", "er", "my", "i", "we", "it", "its",
+    "this", "there", "would", "could", "should", "can", "will", "maybe", "about",
+}
+
+
+def _sounds_unfinished(text: str) -> bool:
+    """
+    Heuristic on the speculative transcript: does this look like a sentence that
+    was cut off? Whisper punctuates, so a missing sentence-final mark is a decent
+    signal, and a trailing conjunction or article is a strong one.
+    """
+    text = text.strip()
+    if not text:
+        return False
+    words = re.findall(r"[A-Za-z']+", text.lower())
+    if words and words[-1] in _HANGING_WORDS:
+        return True
+    return text[-1] not in ".!?。！？"
+
+
+_HALLUCINATIONS = {
+    "you", "you.", "thank you.", "thanks for watching!", "thank you very much.",
+    "bye.", "okay.", "yeah.", "mm-hmm.", "[blank_audio]", "(silence)", ".", "!",
+}
+
+
+def _is_noise_transcript(text: str) -> bool:
+    t = text.strip().lower()
+    return t in _HALLUCINATIONS or len(re.findall(r"[A-Za-z\u4e00-\u9fff]", t)) < 2
+
+
+def _listen_and_transcribe() -> tuple:
+    """
+    Record until you stop speaking, transcribing speculatively during the pause.
+
+    Returns (text, seconds_recorded, seconds_spent_waiting_on_transcription).
+    The third value is normally near zero: the transcription of everything up to
+    EAGER_SILENCE runs on a worker thread while we are still confirming that the
+    pause really was the end of your turn.
+    """
+    path = RECORDING_PATH
+    vad          = _get_vad()
+    chunk_frames = int(SAMPLE_RATE * 0.1)                      # 100 ms
+    warmup_chunks   = 2                            # let the input stream settle
+    eager_chunks    = int(EAGER_SILENCE / 0.1)
+    commit_chunks   = int(COMMIT_SILENCE / 0.1)
+    extended_chunks = int(EXTENDED_SILENCE / 0.1)
+    min_speech   = int(MIN_SPEECH_SECONDS / 0.1)
+    max_chunks   = int(MAX_RECORD_SECONDS / 0.1)
+    window_samps = int(SAMPLE_RATE * VAD_WINDOW_SECONDS)
+
+    global _status
+    _status = "Listening — speak now"
+    recorded, silence_count, speech_chunks = [], 0, 0
+    pending, speculated, generation = None, False, 0
+    result = {}
+
+    def _spawn(audio: np.ndarray):
+        """
+        Transcribe a snapshot on a worker thread; the result lands in `result`.
+        Each attempt gets its own file and generation number, so a worker left
+        over from a pause you spoke through cannot clobber the current one.
+        """
+        nonlocal generation
+        generation += 1
+        gen       = generation
+        snap      = audio.copy()
+        snap_path = f"{path}.{gen}.wav"
+
+        def work():
+            try:
+                _wavfile.write(snap_path, SAMPLE_RATE, snap)
+                text = _transcribe(snap_path)
+                if gen == generation:          # still the live attempt
+                    result["text"] = text
+            finally:
+                try:
+                    os.remove(snap_path)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        return t
+
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="int16") as stream:
         for i in range(max_chunks):
             if _stop_event.is_set():
                 break
             chunk, _ = stream.read(chunk_frames)
             recorded.append(chunk.copy())
-            rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
-            if i >= min_chunks:
-                if rms < SILENCE_THRESHOLD:
-                    silence_count += 1
-                    if silence_count >= silence_chunks_max:
-                        break
-                else:
-                    silence_count = 0
-    audio = np.concatenate(recorded, axis=0)
-    _wavfile.write(RECORDING_PATH, SAMPLE_RATE, audio)
+
+            tail   = np.concatenate(recorded[-int(VAD_WINDOW_SECONDS / 0.1):], axis=0).reshape(-1)
+            tail   = (tail[-window_samps:] / 32768.0)
+            speech = _is_speech(vad, tail)
+
+            if i < warmup_chunks:
+                continue
+
+            if speech:
+                speech_chunks += 1
+                if speculated:
+                    _status = "Still listening…"
+                silence_count, pending, speculated = 0, None, False
+                result.clear()
+                continue
+
+            # Nothing said yet — this is not a pause, you simply have not started.
+            # Without this gate the turn would end on pure silence a second or two
+            # after the assistant stopped talking, and Whisper hallucinates a word
+            # like "you" out of the noise, which the LLM then earnestly answers.
+            if speech_chunks < min_speech:
+                continue
+
+            silence_count += 1
+
+            # Pause long enough to be worth guessing on, but not to commit yet.
+            if silence_count == eager_chunks:
+                pending    = _spawn(np.concatenate(recorded, axis=0).reshape(-1))
+                speculated = True
+
+            if silence_count >= commit_chunks:
+                # The speculative transcript is usually ready by now (it started
+                # 1.2 s ago). If it reads as unfinished, give you longer to resume.
+                guess = result.get("text", "")
+                if guess and _sounds_unfinished(guess) and silence_count < extended_chunks:
+                    if silence_count == commit_chunks:
+                        _status = "Waiting — that sounded unfinished…"
+                    continue
+                break
+
+    audio    = np.concatenate(recorded, axis=0).reshape(-1)
+    duration = len(audio) / SAMPLE_RATE
+
+    if not audio.any():
+        # macOS hands out an all-zero stream instead of an error when microphone
+        # access has not been granted. Left unreported, Whisper hallucinates a
+        # word like "you" out of the silence and the LLM answers it, which looks
+        # like the assistant talking to itself.
+        print("  [Microphone delivered pure silence — no audio at all.]")
+        print("  [Check System Settings ▸ Privacy & Security ▸ Microphone, and that")
+        print("   the right input device is selected in Sound settings.]")
+        return "", duration, 0.0
+
+    if speech_chunks < min_speech:      # timed out without hearing you at all
+        return "", duration, 0.0
+
+    t_wait = time.perf_counter()
+    if pending is not None:
+        pending.join(timeout=WHISPER_SERVER_TIMEOUT)
+    if "text" not in result:      # hit MAX_RECORD_SECONDS mid-sentence, or the
+        _wavfile.write(path, SAMPLE_RATE, audio)   # worker timed out — do it now
+        result["text"] = _transcribe(path)
+    wait = time.perf_counter() - t_wait
+
+    text = result.get("text", "")
+    if _is_noise_transcript(text):
+        text = ""
+    return text, duration, wait
+
+# ─── Stage 2: Speech-to-Text via faster-whisper ──────────────────────────────
+
+def _transcribe_via_server(path: str = RECORDING_PATH) -> str | None:
+    """POST the WAV to whisper.cpp server; None if unreachable so we can fall back."""
+    try:
+        with open(path, "rb") as f:
+            resp = requests.post(
+                WHISPER_SERVER_URL,
+                files={"file": ("audio.wav", f, "audio/wav")},
+                data={"temperature": "0", "response_format": "json"},
+                timeout=WHISPER_SERVER_TIMEOUT,
+            )
+        resp.raise_for_status()
+        return " ".join(resp.json().get("text", "").split()).strip()
+    except requests.exceptions.RequestException:
+        return None
 
 
-def _transcribe() -> str:
+def _transcribe(path: str = RECORDING_PATH) -> str:
+    text = _transcribe_via_server(path)
+    if text is not None:
+        return text
+    _load_fallback_whisper()
     segments, _ = _whisper_mdl.transcribe(
-        RECORDING_PATH, language=WHISPER_LANGUAGE,
-        beam_size=5, vad_filter=True, condition_on_previous_text=False,
+        path, language=WHISPER_LANGUAGE,
+        beam_size=1, vad_filter=True, condition_on_previous_text=False,
     )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
@@ -134,7 +339,14 @@ def _ollama_tokens(user_text: str) -> Iterator[str]:
     with _lock:
         system_prompt = _system_prompt
     messages      = [{"role": "system", "content": system_prompt}] + _chat_history
-    payload       = {"model": OLLAMA_MODEL, "messages": messages, "stream": True}
+    payload       = {
+        "model":      OLLAMA_MODEL,
+        "messages":   messages,
+        "stream":     True,
+        "think":      OLLAMA_THINK,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options":    {"num_predict": OLLAMA_NUM_PREDICT},
+    }
     full_response = ""
     try:
         with requests.post(OLLAMA_CHAT_URL, json=payload, stream=True, timeout=120) as resp:
@@ -190,11 +402,16 @@ def _tts_worker(q: queue.Queue):
                 print(f"[TTS error] {exc}")
 
 
-def _load_models():
-    global _whisper_mdl, _piper_voice, _tts_rate
+def _load_fallback_whisper():
+    """Load faster-whisper on demand — only when whisper-server is unreachable."""
+    global _whisper_mdl
     if _whisper_mdl is None:
         device, compute = _get_whisper_device()
         _whisper_mdl = WhisperModel(WHISPER_MODEL_SIZE, device=device, compute_type=compute)
+
+
+def _load_models():
+    global _piper_voice, _tts_rate
     if _piper_voice is None and os.path.exists(PIPER_MODEL):
         try:
             from piper import PiperVoice
@@ -213,27 +430,14 @@ def _run_loop():
         _load_models()
 
         while not _stop_event.is_set():
-            _status = "Listening… (starting in 1 s)"
-            time.sleep(1.0)
-            if _stop_event.is_set():
-                break
+            _status = "Listening…"
 
-            # Record
             try:
-                _status = "Recording — speak now"
-                _record_with_vad()
+                text, _spoke, _wait = _listen_and_transcribe()
                 if _stop_event.is_set():
                     break
             except Exception as exc:
-                _status = f"Recording failed: {exc}"
-                continue
-
-            # Transcribe
-            try:
-                _status = "Transcribing…"
-                text = _transcribe()
-            except Exception as exc:
-                _status = f"Transcription failed: {exc}"
+                _status = f"Listening failed: {exc}"
                 continue
 
             if not text:
