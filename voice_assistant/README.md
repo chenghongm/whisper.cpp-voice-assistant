@@ -209,11 +209,11 @@ Two things to watch for when tuning further:
 | **Resume** | Restarts the loop **keeping** the context it already had |
 | **Clear Conversation** | Wipes the in-memory history and the transcript file |
 
-Stop takes effect in well under a second at every stage — measured 0.14 s while
-speaking, 0.89 s while waiting on a cold model, 0.17 s while listening.
+Stop signals the current session immediately. Start or Resume requested while it
+is stopping begins automatically after the old session releases its microphone
+and speaker. A stalled audio device can still delay that release.
 
-Getting there needed five separate interrupts, because setting a flag only helps
-where something checks it:
+The blocking stages are handled as follows:
 
 - **Audio capture.** `stream.read()` blocks with no timeout. A Bluetooth mic that
   drops its profile when idle just stops delivering, so the loop parked there
@@ -224,17 +224,16 @@ where something checks it:
 - **TTS playback.** `queue.get()` and a whole-sentence `stream.write()` both block
   until the entire reply has been spoken. The queue is now polled, audio is written
   in 0.15 s slices, and `abort()` discards the buffer so the voice cuts mid-word.
-- **The Ollama stream.** A per-token check never runs if no token has arrived, and
-  a cold model can take ~10 s to produce the first one. Stop now closes the
-  response socket so `iter_lines()` raises instead of parking.
-- **Listening.** A stop mid-turn discards the audio rather than spending another
-  second or two transcribing something nobody will answer.
-- **Restarting.** `_stop_event.clear()` on Start used to un-stop a loop that was
-  still winding down, leaving two loops fighting over the microphone. Start now
-  gives the old thread 1 s to exit and then proceeds regardless — every session
-  carries an epoch number, so a straggler that wakes up later sees a number it
-  does not own and returns without touching the microphone, history or status.
-  Refusing to start, as an earlier version did, left the UI stuck for good.
+- **The Ollama stream.** The request and response reader run on a worker thread.
+  The conversation checks for Stop every 0.1 s, including before response headers
+  arrive. Closing the response is also done off the UI thread.
+- **Transcription.** Speculative and final transcription run on worker threads.
+  Stop interrupts the conversation's wait for a result, and the status says
+  "Transcribing…" while it waits.
+- **Restarting.** Each session has its own cancellation signal and network
+  response. Start or Resume waits for the previous conversation and playback to
+  exit, then starts automatically; old workers cannot alter the new session's
+  history or status.
 
 **If it accuses you of repeating its own questions:**
 

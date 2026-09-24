@@ -5,7 +5,7 @@ Run:  python voice_assistant/app.py
 Then open http://localhost:7860 in your browser.
 """
 
-import os, sys, io, json, re, time, wave, platform, threading, queue
+import os, sys, io, json, re, time, wave, platform, threading, queue, tempfile
 from typing import Iterator
 
 
@@ -34,6 +34,7 @@ SAMPLE_RATE        = 16_000
 # STT: whisper.cpp server (CoreML/Metal) first, in-process faster-whisper as fallback.
 WHISPER_SERVER_URL     = "http://localhost:8178/inference"
 WHISPER_SERVER_TIMEOUT = 30
+TRANSCRIPTION_TIMEOUT = 90  # includes a possible local fallback
 WHISPER_MODEL_SIZE = "distil-large-v3"   # fallback only (CPU int8, ~3x slower)
 WHISPER_LANGUAGE   = "en"
 OLLAMA_CHAT_URL    = "http://localhost:11434/api/chat"
@@ -76,21 +77,34 @@ DEFAULT_SYSTEM_PROMPT = (
 
 _SENTENCE_END = re.compile(r'(?<=[.!?。！？])\s+|(?<=[.!?。！？])$')
 
-# ── Shared mutable state (guarded by _lock where needed) ──────────────────────
+# ── Shared mutable state ────────────────────────────────────────────────────────
 
 _lock          = threading.Lock()
 _system_prompt = DEFAULT_SYSTEM_PROMPT
 _chat_history  = []
 _status        = "Idle"
-_stop_event    = threading.Event()
-_tts_abort     = threading.Event()   # cuts playback without ending the session
-_is_running    = False
+_session       = None
 _loop_thread   = None
-_loop_epoch    = 0      # bumped on every start; a stale loop sees it and bows out
-_live_response = None   # in-flight Ollama response, so Stop can close the socket
+_pending_start = None  # None, fresh conversation (True), or resume (False)
 _whisper_mdl   = None
 _piper_voice   = None
 _tts_rate      = None
+
+
+class _Session:
+    def __init__(self):
+        self.stop = threading.Event()
+        self.tts_abort = threading.Event()
+        self.response_lock = threading.Lock()
+        self.response = None
+        self.player = None
+
+
+def _set_status(session: _Session, value: str):
+    global _status
+    with _lock:
+        if _session is session and not session.stop.is_set():
+            _status = value
 
 # ── Audio / AI helpers ─────────────────────────────────────────────────────────
 
@@ -186,7 +200,7 @@ def _is_noise_transcript(text: str) -> bool:
     return t in _HALLUCINATIONS or len(re.findall(r"[A-Za-z\u4e00-\u9fff]", t)) < 2
 
 
-def _listen_and_transcribe() -> tuple:
+def _listen_and_transcribe(session: _Session) -> tuple:
     """
     Record until you stop speaking, transcribing speculatively during the pause.
 
@@ -195,7 +209,6 @@ def _listen_and_transcribe() -> tuple:
     EAGER_SILENCE runs on a worker thread while we are still confirming that the
     pause really was the end of your turn.
     """
-    path = RECORDING_PATH
     vad          = _get_vad()
     chunk_frames = int(SAMPLE_RATE * 0.1)                      # 100 ms
     warmup_chunks   = 2                            # let the input stream settle
@@ -206,39 +219,34 @@ def _listen_and_transcribe() -> tuple:
     max_chunks   = int(MAX_RECORD_SECONDS / 0.1)
     window_samps = int(SAMPLE_RATE * VAD_WINDOW_SECONDS)
 
-    global _status
-    _status = "Listening — speak now"
+    _set_status(session, "Listening — speak now")
     recorded, silence_count, speech_chunks = [], 0, 0
-    pending, speculated, generation = None, False, 0
-    result = {}
+    pending, speculated = None, False
 
     def _spawn(audio: np.ndarray):
-        """
-        Transcribe a snapshot on a worker thread; the result lands in `result`.
-        Each attempt gets its own file and generation number, so a worker left
-        over from a pause you spoke through cannot clobber the current one.
-        """
-        nonlocal generation
-        generation += 1
-        gen       = generation
+        """Transcribe one immutable snapshot; abandoned workers own no session state."""
         snap      = audio.copy()
-        snap_path = f"{path}.{gen}.wav"
+        result = {"done": threading.Event(), "text": "", "error": None}
 
         def work():
+            snap_path = None
             try:
+                fd, snap_path = tempfile.mkstemp(prefix="va_recording_", suffix=".wav")
+                os.close(fd)
                 _wavfile.write(snap_path, SAMPLE_RATE, snap)
-                text = _transcribe(snap_path)
-                if gen == generation:          # still the live attempt
-                    result["text"] = text
+                result["text"] = _transcribe(snap_path)
+            except Exception as exc:
+                result["error"] = exc
             finally:
-                try:
-                    os.remove(snap_path)
-                except OSError:
-                    pass
+                if snap_path is not None:
+                    try:
+                        os.remove(snap_path)
+                    except OSError:
+                        pass
+                result["done"].set()
 
-        t = threading.Thread(target=work, daemon=True)
-        t.start()
-        return t
+        threading.Thread(target=work, daemon=True).start()
+        return result
 
     # Callback-driven capture rather than stream.read(), which blocks with no
     # timeout: a Bluetooth headset that drops its microphone profile when idle
@@ -255,15 +263,14 @@ def _listen_and_transcribe() -> tuple:
                         blocksize=chunk_frames, callback=_on_audio):
         i = -1
         while i < max_chunks - 1:
-            if _stop_event.is_set():
+            if session.stop.is_set():
                 break
             try:
                 chunk = audio_q.get(timeout=0.1)
             except queue.Empty:
                 stall_ticks += 1
                 if stall_ticks >= stall_limit:
-                    _status = ("Microphone stopped sending audio — re-arming. "
-                               "Bluetooth mics often drop out when idle.")
+                    _set_status(session, "Microphone stopped sending audio — re-arming")
                     return "", 0.0, 0.0
                 continue
             stall_ticks = 0
@@ -271,7 +278,7 @@ def _listen_and_transcribe() -> tuple:
             recorded.append(chunk)
 
             if speech_chunks == 0 and i > 0 and i % 30 == 0:
-                _status = f"Listening… ({i // 10}s, nothing heard yet)"
+                _set_status(session, f"Listening… ({i // 10}s, nothing heard yet)")
 
             tail   = np.concatenate(recorded[-int(VAD_WINDOW_SECONDS / 0.1):], axis=0).reshape(-1)
             tail   = (tail[-window_samps:] / 32768.0)
@@ -283,9 +290,8 @@ def _listen_and_transcribe() -> tuple:
             if speech:
                 speech_chunks += 1
                 if speculated:
-                    _status = "Still listening…"
+                    _set_status(session, "Still listening…")
                 silence_count, pending, speculated = 0, None, False
-                result.clear()
                 continue
 
             # Nothing said yet — this is not a pause, you simply have not started.
@@ -305,16 +311,16 @@ def _listen_and_transcribe() -> tuple:
             if silence_count >= commit_chunks:
                 # The speculative transcript is usually ready by now (it started
                 # 1.2 s ago). If it reads as unfinished, give you longer to resume.
-                guess = result.get("text", "")
+                guess = pending["text"] if pending and pending["done"].is_set() else ""
                 if guess and _sounds_unfinished(guess) and silence_count < extended_chunks:
                     if silence_count == commit_chunks:
-                        _status = "Waiting — that sounded unfinished…"
+                        _set_status(session, "Waiting — that sounded unfinished…")
                     continue
                 break
 
     # Stop pressed: drop everything captured and do not spend 1-2 s transcribing
     # audio nobody will hear a reply to.
-    if _stop_event.is_set() or not recorded:
+    if session.stop.is_set() or not recorded:
         return "", 0.0, 0.0
 
     audio    = np.concatenate(recorded, axis=0).reshape(-1)
@@ -333,15 +339,22 @@ def _listen_and_transcribe() -> tuple:
     if speech_chunks < min_speech:      # timed out without hearing you at all
         return "", duration, 0.0
 
+    _set_status(session, "Transcribing…")
     t_wait = time.perf_counter()
-    if pending is not None:
-        pending.join(timeout=WHISPER_SERVER_TIMEOUT)
-    if "text" not in result:      # hit MAX_RECORD_SECONDS mid-sentence, or the
-        _wavfile.write(path, SAMPLE_RATE, audio)   # worker timed out — do it now
-        result["text"] = _transcribe(path)
+    if pending is None:
+        pending = _spawn(audio)
+    while not pending["done"].wait(0.1):
+        if session.stop.is_set():
+            return "", duration, time.perf_counter() - t_wait
+        if time.perf_counter() - t_wait >= TRANSCRIPTION_TIMEOUT:
+            _set_status(session, "Transcription timed out — listening again")
+            return "", duration, time.perf_counter() - t_wait
+    if session.stop.is_set():
+        return "", duration, time.perf_counter() - t_wait
+    if pending["error"] is not None:
+        raise pending["error"]
     wait = time.perf_counter() - t_wait
-
-    text = result.get("text", "")
+    text = pending["text"]
     if _is_noise_transcript(text):
         text = ""
     return text, duration, wait
@@ -438,12 +451,12 @@ def _strip_echo(text: str, last_reply: str) -> str:
     return "" if len(_echo_words(out)) < 2 else out
 
 
-def _ollama_tokens(user_text: str) -> Iterator[str]:
+def _ollama_tokens(session: _Session, user_text: str) -> Iterator[str]:
     _chat_history.append({"role": "user", "content": user_text})
     _trim_history()
     with _lock:
         system_prompt = _system_prompt
-    messages      = [{"role": "system", "content": system_prompt}] + _chat_history
+    messages      = [{"role": "system", "content": system_prompt}] + list(_chat_history)
     payload       = {
         "model":      OLLAMA_MODEL,
         "messages":   messages,
@@ -452,28 +465,52 @@ def _ollama_tokens(user_text: str) -> Iterator[str]:
         "keep_alive": OLLAMA_KEEP_ALIVE,
         "options":    {"num_predict": OLLAMA_NUM_PREDICT},
     }
-    global _live_response
+    tokens = queue.Queue()
+
+    def fetch():
+        resp = None
+        try:
+            # Requests cannot interrupt a blocked POST or read reliably from a
+            # second thread. Keep it off the conversation/UI threads instead.
+            with requests.post(OLLAMA_CHAT_URL, json=payload, stream=True,
+                               timeout=(5, 120)) as resp:
+                with session.response_lock:
+                    session.response = resp
+                if session.stop.is_set():
+                    return
+                resp.raise_for_status()
+                for line in resp.iter_lines(chunk_size=1):
+                    if session.stop.is_set():
+                        return
+                    if line:
+                        data = json.loads(line)
+                        tokens.put(("token", data.get("message", {}).get("content", "")))
+                        if data.get("done"):
+                            break
+        except Exception as exc:
+            tokens.put(("error", exc))
+        finally:
+            with session.response_lock:
+                if session.response is resp:
+                    session.response = None
+            tokens.put(("done", None))
+
+    threading.Thread(target=fetch, daemon=True).start()
     full_response = ""
-    try:
-        with requests.post(OLLAMA_CHAT_URL, json=payload, stream=True, timeout=120) as resp:
-            _live_response = resp
-            resp.raise_for_status()
-            for line in resp.iter_lines():
-                if not line:
-                    continue
-                data  = json.loads(line)
-                token = data.get("message", {}).get("content", "")
-                full_response += token
-                yield token
-                if data.get("done"):
-                    break
-        if full_response.strip():
-            _chat_history.append({"role": "assistant", "content": full_response.strip()})
-    except Exception as exc:
-        if not _stop_event.is_set():       # closing the socket on Stop is expected
-            yield f"[Error: {exc}]"
-    finally:
-        _live_response = None
+    while not session.stop.is_set():
+        try:
+            kind, value = tokens.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if kind == "token":
+            full_response += value
+            yield value
+        elif kind == "error":
+            yield f"[Error: {value}]"
+        else:
+            if full_response.strip() and not session.stop.is_set():
+                _chat_history.append({"role": "assistant", "content": full_response.strip()})
+            return
 
 
 def _clean_for_tts(text: str) -> str:
@@ -498,7 +535,7 @@ def _synthesize_pcm(text: str) -> np.ndarray:
     return np.frombuffer(frames, dtype=np.int16)
 
 
-def _tts_worker(q: queue.Queue):
+def _tts_worker(session: _Session, q: queue.Queue):
     """
     Play queued sentences, staying responsive to Stop. A blocking q.get() and a
     whole-sentence stream.write() were the reason Stop appeared to do nothing:
@@ -509,7 +546,7 @@ def _tts_worker(q: queue.Queue):
     slice_frames = max(1, int(_tts_rate * TTS_ABORT_SLICE))
     with sd.OutputStream(samplerate=_tts_rate, channels=1, dtype="int16") as stream:
         while True:
-            if _stop_event.is_set() or _tts_abort.is_set():
+            if session.stop.is_set() or session.tts_abort.is_set():
                 stream.abort()
                 return
             try:
@@ -524,7 +561,7 @@ def _tts_worker(q: queue.Queue):
                     continue
                 audio = _synthesize_pcm(clean)
                 for i in range(0, len(audio), slice_frames):
-                    if _stop_event.is_set() or _tts_abort.is_set():
+                    if session.stop.is_set() or session.tts_abort.is_set():
                         stream.abort()
                         return
                     stream.write(audio[i:i + slice_frames])
@@ -553,26 +590,20 @@ def _load_models():
 
 # ── Conversation loop (runs in background thread) ──────────────────────────────
 
-def _run_loop(epoch: int = 0):
-    global _status, _is_running
-
-    def _mine() -> bool:
-        """False once a newer session has taken over, or Stop was pressed."""
-        return epoch == _loop_epoch and not _stop_event.is_set()
-
+def _run_loop(session: _Session):
     try:
-        _status = "Loading models…"
+        _set_status(session, "Loading models…")
         _load_models()
 
-        while _mine():
-            _status = "Listening…"
+        while not session.stop.is_set():
+            _set_status(session, "Listening…")
 
             try:
-                text, _spoke, _wait = _listen_and_transcribe()
-                if not _mine():
+                text, _spoke, _wait = _listen_and_transcribe(session)
+                if session.stop.is_set():
                     break
             except Exception as exc:
-                _status = f"Listening failed: {exc}"
+                _set_status(session, f"Listening failed: {exc}")
                 continue
 
             last_reply = (_chat_history[-1]["content"]
@@ -583,23 +614,24 @@ def _run_loop(epoch: int = 0):
             text = cleaned
 
             if not text:
-                _status = "Nothing heard — listening again"
+                _set_status(session, "Nothing heard — listening again")
                 continue
 
-            _status = f"You: {text[:70]}{'…' if len(text) > 70 else ''}"
+            _set_status(session, f"You: {text[:70]}{'…' if len(text) > 70 else ''}")
 
             # LLM + TTS
             try:
                 tts_buf = ""
                 if _piper_voice:
-                    _tts_abort.clear()
+                    session.tts_abort.clear()
                     tts_q  = queue.Queue()
-                    player = threading.Thread(target=_tts_worker, args=(tts_q,), daemon=True)
+                    player = threading.Thread(target=_tts_worker, args=(session, tts_q), daemon=True)
+                    session.player = player
                     player.start()
-                    _status = "Thinking + Speaking…"
+                    _set_status(session, "Thinking + Speaking…")
 
-                    for token in _ollama_tokens(text):
-                        if _stop_event.is_set():
+                    for token in _ollama_tokens(session, text):
+                        if session.stop.is_set():
                             break
                         tts_buf += token
                         while True:
@@ -621,132 +653,171 @@ def _run_loop(epoch: int = 0):
                                 tts_q.put(tts_buf.strip())
                                 tts_buf = ""
 
-                    if tts_buf.strip() and not _stop_event.is_set():
+                    if tts_buf.strip() and not session.stop.is_set():
                         tts_q.put(tts_buf.strip())
                     tts_q.put(None)
-                    # Wait for the reply to actually finish being spoken. Capping
-                    # this at 10 s was wrong: most replies take far longer, so the
-                    # loop moved on and opened the microphone while the assistant
-                    # was still talking, and then transcribed itself. The worker
-                    # exits within ~0.15 s of Stop, so waiting here is safe; the
-                    # ceiling below only guards against a wedged output device.
-                    _status = "Speaking…"
-                    player.join(timeout=TTS_MAX_PLAYBACK)
-                    if player.is_alive():
-                        _status = "Output device stalled — dropping the rest of the reply"
-                        _tts_abort.set()
-                        player.join(timeout=2.0)
-                        _tts_abort.clear()
+                    _set_status(session, "Speaking…")
+                    deadline = time.monotonic() + TTS_MAX_PLAYBACK
+                    while player.is_alive() and not session.stop.is_set():
+                        player.join(timeout=0.1)
+                        if time.monotonic() >= deadline:
+                            _set_status(session, "Output device stalled — stopping playback")
+                            session.tts_abort.set()
+                            break
+                    if not player.is_alive():
+                        session.player = None
                     # Let the speaker actually go quiet before the mic reopens.
                     # Bluetooth output trails the write by 150-300 ms, so without
                     # this the tail of the last sentence lands in the next turn.
-                    if not _stop_event.is_set():
-                        _status = "…"
-                        time.sleep(ECHO_SETTLE_SECONDS)
+                    if not session.stop.is_set() and session.player is None:
+                        _set_status(session, "…")
+                        session.stop.wait(ECHO_SETTLE_SECONDS)
                 else:
-                    _status = "Thinking…"
-                    for _ in _ollama_tokens(text):
-                        if _stop_event.is_set():
+                    _set_status(session, "Thinking…")
+                    for _ in _ollama_tokens(session, text):
+                        if session.stop.is_set():
                             break
 
-                if not _mine():
+                if session.stop.is_set():
                     if _chat_history and _chat_history[-1]["role"] == "user":
                         _chat_history.pop()      # interrupted before any reply
                     break
+
+                # Do not reopen the microphone while the output device is still
+                # owned by a stalled player. Stop remains responsive.
+                while session.player is not None and session.player.is_alive():
+                    _set_status(session, "Waiting for output device to release…")
+                    session.player.join(timeout=0.1)
+                    if session.stop.is_set():
+                        break
+                if session.stop.is_set():
+                    break
+                session.player = None
 
                 if _chat_history and _chat_history[-1]["role"] == "assistant":
                     _append_transcript(text, _chat_history[-1]["content"])
 
             except Exception as exc:
-                _status = f"LLM/TTS error: {exc}"
+                session.tts_abort.set()
+                if session.player is not None:
+                    while session.player.is_alive() and not session.stop.is_set():
+                        session.player.join(timeout=0.1)
+                    if not session.player.is_alive():
+                        session.player = None
+                _set_status(session, f"LLM/TTS error: {exc}")
                 continue
 
     except Exception as exc:
-        if epoch == _loop_epoch:
-            _status = f"Fatal error: {exc}"
+        _set_status(session, f"Fatal error: {exc}")
     finally:
-        if epoch == _loop_epoch:        # a straggler must not clobber the live session
-            _is_running = False
-            _status = "Stopped"
+        if session.player is not None and session.player.is_alive():
+            session.tts_abort.set()
+            session.player.join()  # keep the mic reserved until playback exits
+        _finish_session(session)
 
 # ── Gradio UI callbacks ────────────────────────────────────────────────────────
 
-def _start_loop(clear_history: bool) -> bool:
-    """
-    Launch the conversation loop. Returns True if it started.
-
-    The previous loop must be fully dead before _stop_event is cleared: clearing
-    it while an old loop is still winding down un-stops that loop, and two of them
-    then fight over the microphone.
-    """
-    global _is_running, _loop_thread, _status, _loop_epoch
-    if _is_running:
-        _status = "Already running"
-        return False
-
-    # Give a previous loop a moment to exit, then start regardless. Refusing to
-    # start left the UI permanently stuck whenever the old loop was wedged. The
-    # epoch below makes that safe: a straggler that wakes up later sees a number
-    # it does not own and returns without touching the mic, history or status.
-    if _loop_thread is not None and _loop_thread.is_alive():
-        _stop_event.set()
-        _loop_thread.join(timeout=1.0)
-
-    _loop_epoch += 1
-    epoch = _loop_epoch
+def _launch_locked(clear_history: bool):
+    """Start a session while holding _lock; only called after the old one exits."""
+    global _session, _loop_thread, _status
     if clear_history:
         _chat_history.clear()
-    _stop_event.clear()
-    _loop_thread = threading.Thread(target=_run_loop, args=(epoch,), daemon=True)
+    session = _Session()
+    _session = session
+    _status = "Starting…"
+    _loop_thread = threading.Thread(target=_run_loop, args=(session,), daemon=True)
     _loop_thread.start()
-    _is_running = True
-    return True
+
+
+def _finish_session(session: _Session):
+    global _session, _status, _pending_start
+    with _lock:
+        if _session is not session:
+            return
+        _session = None
+        requested = _pending_start
+        _pending_start = None
+        if requested is None:
+            _status = "Stopped"
+        else:
+            _launch_locked(requested)
+
+
+def _start_loop(clear_history: bool) -> bool:
+    global _status, _pending_start
+    with _lock:
+        if _session is not None:
+            if _session.stop.is_set():
+                _pending_start = clear_history
+                _status = "Finishing previous session; starting automatically…"
+                return True
+            _status = "Already running"
+            return False
+        _launch_locked(clear_history)
+        return True
 
 
 def _stop_loop() -> None:
-    """
-    Signal the loop and unblock it. Setting the event is not enough on its own:
-    a cold model leaves the loop parked inside iter_lines() for ~10 s with no
-    token to check the flag against, so the socket is closed out from under it.
-    """
-    global _is_running, _status
-    _stop_event.set()
-    resp = _live_response
-    if resp is not None:
-        try:
-            resp.close()
-        except Exception:
-            pass
-    _is_running = False
-    _status = "Stopping…"
+    """Signal cancellation without blocking a Gradio callback on network I/O."""
+    global _status
+    with _lock:
+        session = _session
+        if session is None:
+            return
+        session.stop.set()
+        session.tts_abort.set()
+        _status = "Stopping…"
+
+    def close_response():
+        with session.response_lock:
+            resp = session.response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=close_response, daemon=True).start()
 
 
 def _button_state():
-    return (gr.update(value="Stop", variant="stop") if _is_running
-            else gr.update(value="Start Conversation", variant="primary"))
+    with _lock:
+        session = _session
+        queued = _pending_start is not None
+    if queued:
+        return gr.update(value="Starting…", variant="primary", interactive=False)
+    if session is not None and session.stop.is_set():
+        return gr.update(value="Stopping…", variant="stop", interactive=False)
+    if session is not None:
+        return gr.update(value="Stop", variant="stop", interactive=True)
+    return gr.update(value="Start Conversation", variant="primary", interactive=True)
 
 
 def ui_toggle():
     """Stop ends the session. Start begins a fresh one, discarding context."""
-    global _status
-    if _is_running:
+    with _lock:
+        running = _session is not None and not _session.stop.is_set()
+    if running:
         _stop_loop()
-    elif _start_loop(clear_history=True):
-        _status = "Starting…"
+    else:
+        _start_loop(clear_history=True)
     return _button_state()
 
 
 def ui_resume():
     """Pick the conversation back up with the context it already has."""
     global _status
-    if _is_running:
-        _status = "Already running"
-    elif not _chat_history:
-        _status = "Nothing to resume — press Start Conversation"
+    with _lock:
+        running = _session is not None and not _session.stop.is_set()
+        has_history = bool(_chat_history)
+    if running:
+        with _lock:
+            _status = "Already running"
+    elif not has_history:
+        with _lock:
+            _status = "Nothing to resume — press Start Conversation"
     else:
-        turns = len(_chat_history) // 2
-        if _start_loop(clear_history=False):
-            _status = f"Resumed with {turns} turn(s) of context"
+        _start_loop(clear_history=False)
     return _button_state()
 
 
@@ -758,13 +829,8 @@ def ui_save_prompt(new_prompt: str):
 
 
 def ui_get_status():
-    # Never leave a stale "Listening…" or "Stopping…" on screen once the loop is
-    # actually gone — a status that lies about what is happening is exactly what
-    # makes the UI feel hung.
-    if not _is_running and (_loop_thread is None or not _loop_thread.is_alive()):
-        if _status.endswith("…"):
-            return "Stopped"
-    return _status
+    with _lock:
+        return _status
 
 
 def ui_get_transcript():

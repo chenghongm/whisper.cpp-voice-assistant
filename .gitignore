@@ -65,3 +65,11 @@ local.properties
 .log
 .exe
 voice_assistant/conversation.txt
+
+#__pycache__
+voice_assistant/__pycache__/*
+
+#conversation record
+
+voice_assistant/conversation.txt
+
