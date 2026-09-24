@@ -200,6 +200,81 @@ Two things to watch for when tuning further:
 
 ---
 
+## 4c — Web UI controls (`app.py`)
+
+| Button | Effect |
+|---|---|
+| **Start Conversation** | Begins a new session and **clears** the chat history |
+| **Stop** | Ends the session. Cuts off mid-word if it is speaking |
+| **Resume** | Restarts the loop **keeping** the context it already had |
+| **Clear Conversation** | Wipes the in-memory history and the transcript file |
+
+Stop takes effect in well under a second at every stage — measured 0.14 s while
+speaking, 0.89 s while waiting on a cold model, 0.17 s while listening.
+
+Getting there needed five separate interrupts, because setting a flag only helps
+where something checks it:
+
+- **Audio capture.** `stream.read()` blocks with no timeout. A Bluetooth mic that
+  drops its profile when idle just stops delivering, so the loop parked there
+  forever — Stop never took effect and Start reported the old session as still
+  stopping. Capture is now callback-driven with a polled queue, and a device that
+  goes quiet for `AUDIO_STALL_SECONDS` is reported and re-armed instead of hanging.
+
+- **TTS playback.** `queue.get()` and a whole-sentence `stream.write()` both block
+  until the entire reply has been spoken. The queue is now polled, audio is written
+  in 0.15 s slices, and `abort()` discards the buffer so the voice cuts mid-word.
+- **The Ollama stream.** A per-token check never runs if no token has arrived, and
+  a cold model can take ~10 s to produce the first one. Stop now closes the
+  response socket so `iter_lines()` raises instead of parking.
+- **Listening.** A stop mid-turn discards the audio rather than spending another
+  second or two transcribing something nobody will answer.
+- **Restarting.** `_stop_event.clear()` on Start used to un-stop a loop that was
+  still winding down, leaving two loops fighting over the microphone. Start now
+  gives the old thread 1 s to exit and then proceeds regardless — every session
+  carries an epoch number, so a straggler that wakes up later sees a number it
+  does not own and returns without touching the microphone, history or status.
+  Refusing to start, as an earlier version did, left the UI stuck for good.
+
+**If it accuses you of repeating its own questions:**
+
+The microphone is hearing the assistant. This happens whenever the speaker and the
+microphone are the same device — a laptop without headphones, or a Bluetooth
+speaker. Whisper transcribes the assistant's own voice, it arrives as if you had
+said it, and the model reasonably concludes you are parroting it back. The
+transcript gives it away: a `You:` line that repeats the previous `Assistant:`
+line, often just its tail, because Bluetooth output trails the write by 150-300 ms
+and the last sentence is still in the air when the microphone opens.
+
+The first thing to rule out is the loop talking over itself: if the UI says
+"Listening…" while you can still hear the assistant, the microphone is open during
+playback and every reply will echo. Waiting for playback must not be capped — one
+version of this loop used `player.join(timeout=10.0)`, and since most replies take
+longer than 10 s to speak, the loop moved on and recorded the rest of the reply
+every single turn. It now waits for playback to genuinely finish; `TTS_MAX_PLAYBACK`
+is only a ceiling for a wedged output device, and it cuts playback through a
+separate signal rather than ending the session.
+
+Two further defences, both on by default:
+
+- `ECHO_SETTLE_SECONDS` (0.6 s) keeps the microphone shut until the speaker is
+  really quiet. An earlier version of this loop had a `time.sleep(1.0)` at the top
+  that was doing this by accident; removing it as dead latency brought the problem
+  out into the open.
+- `_strip_echo()` drops leading sentences the assistant just spoke. The test is a
+  *contiguous* run of shared words (`ECHO_MIN_RUN`, 4) covering enough of the
+  sentence (`ECHO_OVERLAP`, 0.55) — you will reuse the interviewer's vocabulary
+  constantly, but you will not reproduce four of its words in a row by accident.
+  When it fires, the console prints what it heard and what it kept.
+
+**The real fix is headphones.** Echo cancellation at the text level is a backstop,
+not a substitute: anything the assistant says that you then genuinely repeat will
+be stripped too, and a long enough echo can still slip through mid-sentence.
+
+**If it says the microphone stopped sending audio:** that is a real dropout, not a
+bug — Bluetooth headsets commonly release the mic when idle. The loop re-arms by
+itself. If it keeps happening, switch Sound ▸ Input to the built-in microphone.
+
 ## 5 — Configuration
 
 All options are at the top of `main.py`:
@@ -210,6 +285,10 @@ All options are at the top of `main.py`:
 | `EAGER_SILENCE` | `0.6` | Quiet before a speculative transcription starts |
 | `COMMIT_SILENCE` | `1.8` | Quiet before your turn ends — raise if it cuts you off |
 | `EXTENDED_SILENCE` | `4.0` | Used instead when the transcript sounds unfinished |
+| `ECHO_SETTLE_SECONDS` | `0.6` | Quiet gap after speaking before the mic reopens |
+| `ECHO_MIN_RUN` | `4` | Consecutive shared words that mark a sentence as echo |
+| `ECHO_OVERLAP` | `0.55` | Fraction of the sentence that run must cover |
+| `AUDIO_STALL_SECONDS` | `2.0` | Silence from the *device* before declaring a dropout |
 | `VAD_THRESHOLD` | `0.45` | Silero speech probability; lower = more sensitive |
 | `SILENCE_THRESHOLD` | `300` | RMS fallback, only if Silero fails to load |
 | `WHISPER_SERVER_URL` | `http://localhost:8178/inference` | whisper.cpp server; unreachable → local fallback |

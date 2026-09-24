@@ -113,6 +113,12 @@ MIN_SPEECH_SECONDS = 0.4   # your turn does not end until this much *speech* was
 
 VAD_THRESHOLD      = 0.45  # Silero speech probability; lower = more sensitive
 VAD_WINDOW_SECONDS = 1.5   # rolling context fed to Silero each tick
+AUDIO_STALL_SECONDS = 2.0  # no audio for this long = device went away; give up
+
+# Echo rejection (speaker bleeding into the microphone)
+ECHO_SETTLE_SECONDS = 0.6   # quiet gap after speaking before the mic opens
+ECHO_MIN_RUN        = 4     # consecutive shared words that mark a sentence as echo
+ECHO_OVERLAP        = 0.55  # ...and the fraction of the sentence they must cover
 SILENCE_THRESHOLD  = 300   # RMS fallback, used only if Silero fails to load
 
 # TTS speed: 1.0 = normal, 1.2 = ~20% slower, 1.4 = noticeably slower
@@ -299,10 +305,31 @@ def listen_and_transcribe(path: str) -> tuple:
         t.start()
         return t
 
-    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16") as stream:
-        for i in range(max_chunks):
-            chunk, _ = stream.read(chunk_frames)
-            recorded.append(chunk.copy())
+    # Callback-driven capture rather than stream.read(), which blocks with no
+    # timeout: a Bluetooth headset that drops its microphone profile when idle
+    # simply stops delivering, and a blocking read parks there forever.
+    audio_q: queue.Queue = queue.Queue()
+
+    def _on_audio(indata, frames, time_info, status):
+        audio_q.put(indata.copy())
+
+    stall_ticks, stall_limit = 0, int(AUDIO_STALL_SECONDS / 0.1)
+
+    with sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                        blocksize=chunk_frames, callback=_on_audio):
+        i = -1
+        while i < max_chunks - 1:
+            try:
+                chunk = audio_q.get(timeout=0.1)
+            except queue.Empty:
+                stall_ticks += 1
+                if stall_ticks >= stall_limit:
+                    print("  [Microphone stopped sending audio — re-arming.]")
+                    return "", 0.0, 0.0
+                continue
+            stall_ticks = 0
+            i += 1
+            recorded.append(chunk)
 
             tail   = np.concatenate(recorded[-int(VAD_WINDOW_SECONDS / 0.1):], axis=0).reshape(-1)
             tail   = (tail[-window_samps:] / 32768.0)
@@ -434,6 +461,68 @@ def transcribe(path: str) -> str:
         return text
     print("  [whisper-server unreachable — using slower in-process fallback]")
     return _transcribe_local(path)
+
+# ─── Echo rejection ───────────────────────────────────────────────────────────
+#
+# When the speaker and the microphone are the same device — a laptop without
+# headphones, or a Bluetooth speaker like a soundcore — the microphone hears the
+# assistant. Whisper faithfully transcribes it, the text arrives as if you had
+# said it, and the model concludes you are parroting its own questions back.
+#
+# Bluetooth output lags 150-300 ms behind the write, so waiting for playback to
+# "finish" is not enough; the tail of the last sentence is still in the air when
+# the microphone opens. ECHO_SETTLE_SECONDS buys that time back, and the check
+# below catches whatever still gets through.
+
+def _echo_words(text: str) -> list:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _longest_run(a: list, b: list) -> int:
+    """Longest run of consecutive words appearing in both lists."""
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for x in a:
+        cur = [0] * (len(b) + 1)
+        for j, y in enumerate(b, 1):
+            if x == y:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+def _strip_echo(text: str, last_reply: str) -> str:
+    """
+    Remove leading sentences the assistant just spoke. A *contiguous* run of
+    shared words is the test, not a bag-of-words overlap: you will naturally
+    reuse the interviewer's vocabulary, but you will not reproduce four words
+    of it in a row by accident.
+    """
+    if not text or not last_reply:
+        return text
+    ref   = _echo_words(last_reply)
+    parts = [p for p in re.split(r'(?<=[.!?。！？])\s+', text.strip()) if p.strip()]
+
+    kept, dropping, dropped_any = [], True, False
+    for part in parts:
+        if dropping:
+            words = _echo_words(part)
+            run   = _longest_run(words, ref)
+            is_echo = (
+                len(words) >= 3 and run >= ECHO_MIN_RUN and run / len(words) >= ECHO_OVERLAP
+            ) or (dropped_any and len(words) < 3)   # short tail right after an echo
+            if is_echo:
+                dropped_any = True
+                continue
+        dropping = False
+        kept.append(part)
+
+    out = " ".join(kept).strip()
+    return "" if len(_echo_words(out)) < 2 else out
+
 
 # ─── Stage 3: Stream tokens from Ollama (chat API + history) ─────────────────
 
@@ -595,6 +684,14 @@ def main() -> None:
         print(f"  [spoke {spoke:.1f}s | endpoint+transcribe {t2-t0-spoke:.1f}s, "
               f"of which {wait:.1f}s was actually waiting on Whisper]")
 
+        last_reply = (_chat_history[-1]["content"]
+                      if _chat_history and _chat_history[-1]["role"] == "assistant" else "")
+        cleaned = _strip_echo(text, last_reply)
+        if cleaned != text:
+            print(f"  [Echo removed] heard: {text!r}")
+            print(f"                 kept: {cleaned!r}")
+        text = cleaned
+
         if not text:
             print("  [No speech heard this turn — listening again]\n")
             continue
@@ -646,6 +743,9 @@ def main() -> None:
                 tts_queue.put(tts_buf.strip())
             tts_queue.put(None)
             player.join()
+            # Let the speaker go quiet before the mic reopens; Bluetooth output
+            # trails the write by 150-300 ms and the tail lands in the next turn.
+            time.sleep(ECHO_SETTLE_SECONDS)
         else:
             for token in _ollama_tokens(text):
                 print(token, end="", flush=True)
