@@ -73,3 +73,6 @@ voice_assistant/__pycache__/*
 
 voice_assistant/conversation.txt
 
+voice_assistant/practice_log.json
+
+background.txt  

@@ -41,7 +41,7 @@ OLLAMA_CHAT_URL    = "http://localhost:11434/api/chat"
 OLLAMA_MODEL       = "gemma4"
 OLLAMA_THINK       = False   # gemma4 is a reasoning model; thinking costs ~13 s of TTFT
 OLLAMA_KEEP_ALIVE  = "30m"   # keep weights resident; a cold reload costs ~10 s
-OLLAMA_NUM_PREDICT = 200
+OLLAMA_NUM_PREDICT = 150   # a safety cap only; the prompt keeps turns to 2-3 sentences
 MAX_HISTORY_TURNS  = 10
 PIPER_MODEL        = os.path.expanduser("~/piper_models/en_US-lessac-medium.onnx")
 RECORDING_PATH     = "/tmp/va_ui_recording.wav"
@@ -61,19 +61,32 @@ ECHO_SETTLE_SECONDS = 0.6   # quiet gap after speaking before the mic opens
 ECHO_MIN_RUN        = 4     # consecutive shared words that mark a sentence as echo
 ECHO_OVERLAP        = 0.55  # ...and the fraction of the sentence they must cover
 SILENCE_THRESHOLD  = 300   # RMS fallback, used only if Silero fails to load
-TTS_LENGTH_SCALE   = 1.2
+TTS_LENGTH_SCALE   = 1.0
 TTS_ABORT_SLICE    = 0.15  # seconds of audio per write — how fast Stop cuts speech
 TTS_MAX_PLAYBACK   = 180   # hard ceiling on one reply's playback, in seconds
 MAX_TTS_CHARS      = 80
 
+# Mock-interview question bank. The code picks the opening question, not the model:
+# asked to choose, a small model returns the same few "most likely" questions.
+_HERE              = os.path.dirname(os.path.abspath(__file__))
+QUESTIONS_PATH     = os.path.join(_HERE, "questions.txt")
+BACKGROUND_PATH    = os.path.join(_HERE, "background.txt")
+PRACTICE_LOG_PATH  = os.path.join(_HERE, "practice_log.json")
+QUESTION_WEIGHTS   = {"resume": 0.7, "general": 0.3}   # categories missing here get 0.1
+
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a senior technical interviewer at a Tier-1 tech company. "
-    "Your tone is professional and slightly skeptical. "
-    "Provide a 'Bridge Sentence' whenever I am stuck. "
-    "When giving feedback, use a 'Scaffold' approach: tell me the 3 key concepts I "
-    "should have used, then let me try again with those concepts. "
-    "Keep responses concise and natural for speech. "
-    "Avoid markdown, bullet points, or code blocks."
+    "You are a behavioral interviewer at a large tech company, running a spoken mock interview. "
+    "You are professional, direct, and slightly skeptical.\n"
+    "Rules:\n"
+    "- Say at most 2 or 3 short sentences per turn. Ask only one question at a time.\n"
+    "- After each answer, ask one specific follow-up about what the candidate just said: "
+    "a decision, a trade-off, a result, or what they personally did. "
+    "After about two follow-ups, move on to a new behavioral question of your choice.\n"
+    "- Do not summarize or praise the answer.\n"
+    "- If the candidate says they are stuck, give one short hint to help them start. "
+    "Give feedback only when asked: name up to 3 things they missed in one or two sentences, "
+    "then let them try again.\n"
+    "- Speak plain English. No markdown, lists, or parentheses."
 )
 
 _SENTENCE_END = re.compile(r'(?<=[.!?。！？])\s+|(?<=[.!?。！？])$')
@@ -91,6 +104,72 @@ _live_turn     = None  # visible, uncommitted transcript for the current session
 _whisper_mdl   = None
 _piper_voice   = None
 _tts_rate      = None
+_current_question = None  # opening question of the current fresh session
+
+
+# ── Question bank ─────────────────────────────────────────────────────────────
+
+def _load_questions() -> list:
+    """Return [(category, question)] from questions.txt; [] if missing."""
+    out = []
+    try:
+        with open(QUESTIONS_PATH, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'\s*\[([\w-]+)\]\s*(.+)', line)
+                if m and not line.lstrip().startswith("#"):
+                    out.append((m.group(1).lower(), m.group(2).strip()))
+    except OSError:
+        pass
+    return out
+
+
+def _load_practice_log() -> dict:
+    try:
+        with open(PRACTICE_LOG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _pick_question():
+    """Weighted by category, then the least-practiced question within it."""
+    import random
+    questions = _load_questions()
+    if not questions:
+        return None
+    by_cat = {}
+    for cat, q in questions:
+        by_cat.setdefault(cat, []).append(q)
+    cats = list(by_cat)
+    cat = random.choices(cats, weights=[QUESTION_WEIGHTS.get(c, 0.1) for c in cats])[0]
+    log = _load_practice_log()
+    fewest = min(log.get(q, 0) for q in by_cat[cat])
+    question = random.choice([q for q in by_cat[cat] if log.get(q, 0) == fewest])
+    log[question] = log.get(question, 0) + 1
+    try:
+        with open(PRACTICE_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(log, f, indent=2, ensure_ascii=False)
+    except OSError as exc:
+        print(f"[practice log] {exc}")
+    return question
+
+
+def _build_system_prompt(base: str) -> str:
+    parts = [base]
+    try:
+        with open(BACKGROUND_PATH, encoding="utf-8") as f:
+            background = f.read().strip()
+    except OSError:
+        background = ""
+    if background:
+        parts.append("Candidate background. Use it only to ask sharper follow-ups. "
+                     "Never read it aloud, and feel free to ask about things outside it:\n"
+                     + background)
+    with _lock:
+        question = _current_question
+    if question:
+        parts.append(f'You opened this interview by asking: "{question}"')
+    return "\n\n".join(parts)
 
 
 class _Session:
@@ -100,6 +179,7 @@ class _Session:
         self.response_lock = threading.Lock()
         self.response = None
         self.player = None
+        self.opening = None  # question to speak before the first listen
 
 
 def _set_status(session: _Session, value: str):
@@ -511,7 +591,7 @@ def _ollama_tokens(session: _Session, user_text: str) -> Iterator[str]:
     _trim_history()
     with _lock:
         system_prompt = _system_prompt
-    messages      = [{"role": "system", "content": system_prompt}] + list(_chat_history)
+    messages      = [{"role": "system", "content": _build_system_prompt(system_prompt)}] + list(_chat_history)
     payload       = {
         "model":      OLLAMA_MODEL,
         "messages":   messages,
@@ -643,12 +723,40 @@ def _load_models():
         except Exception as exc:
             print(f"[Piper load error] {exc}")
 
+def _speak_opening(session: _Session, question: str):
+    """Ask the chosen question verbatim, with no LLM call, then hand over the mic."""
+    # Gemma's chat template expects user/model turns to alternate, so the
+    # question goes in as a reply to a placeholder user turn.
+    _chat_history.append({"role": "user", "content": "I'm ready."})
+    _chat_history.append({"role": "assistant", "content": question})
+    _append_transcript(session, "(start)", question)
+    if not _piper_voice:
+        return
+    _set_status(session, f"Question: {question[:70]}")
+    session.tts_abort.clear()
+    tts_q  = queue.Queue()
+    player = threading.Thread(target=_tts_worker, args=(session, tts_q), daemon=True)
+    session.player = player
+    player.start()
+    for sentence in _SENTENCE_END.split(question):
+        if sentence.strip():
+            tts_q.put(sentence.strip())
+    tts_q.put(None)
+    while player.is_alive() and not session.stop.is_set():
+        player.join(timeout=0.1)
+    if not player.is_alive():
+        session.player = None
+    if not session.stop.is_set():
+        session.stop.wait(ECHO_SETTLE_SECONDS)
+
 # ── Conversation loop (runs in background thread) ──────────────────────────────
 
 def _run_loop(session: _Session):
     try:
         _set_status(session, "Loading models…")
         _load_models()
+        if session.opening:
+            _speak_opening(session, session.opening)
 
         while not session.stop.is_set():
             _set_status(session, "Listening…")
@@ -779,10 +887,13 @@ def _run_loop(session: _Session):
 def _launch_locked(clear_history: bool):
     """Start a session while holding _lock; only called after the old one exits."""
     global _session, _loop_thread, _status, _live_turn
-    if clear_history:
-        _chat_history.clear()
+    global _current_question
     _live_turn = None
     session = _Session()
+    if clear_history:
+        _chat_history.clear()
+        _current_question = _pick_question()
+        session.opening = _current_question
     _session = session
     _status = "Starting…"
     _loop_thread = threading.Thread(target=_run_loop, args=(session,), daemon=True)

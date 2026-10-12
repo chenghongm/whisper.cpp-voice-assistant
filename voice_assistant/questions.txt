@@ -1,0 +1,41 @@
+# One question per line: [category] question
+# Categories are weighted by QUESTION_WEIGHTS in app.py. Lines starting with # are ignored.
+
+[resume] Walk me through a system you rebuilt from the ground up. Why did it need a rebuild?
+[resume] Tell me about a time you found the root cause of a performance problem.
+[resume] Describe a time you redesigned a database schema. What was wrong with the old one?
+[resume] Tell me about a time data correctness really mattered and how you protected it.
+[resume] Tell me about a project where you were the only developer. How did you make decisions without anyone to review them?
+[resume] Describe the most technically complex feature you have built.
+[resume] Tell me about a time you earned the trust of your manager or team.
+[resume] Tell me about a time you built something for non-technical users. How did you learn what they needed?
+[resume] Describe a time you designed a permissions or access-control system.
+[resume] Tell me about a scheduling or workflow problem you solved in software.
+[resume] Tell me about a time you replaced a system that people were already using every day.
+[resume] Describe a trade-off you made between shipping fast and building it right.
+[resume] Tell me about a time your work had a direct impact on the business or its funding.
+[resume] Why did you move from drug discovery into software engineering?
+[resume] How does your lab research background show up in the way you write software?
+[resume] Tell me about a time you had to learn a new technology quickly to deliver something.
+[resume] Tell me about a bug in production that you owned. What happened and what did you change after?
+[resume] Describe a time you simplified a workflow that was causing extra work for others.
+[resume] Tell me about a time you had to explain a technical decision to a non-technical stakeholder.
+[resume] What is a project you are proud of, and what would you do differently today?
+[resume] Tell me about a time you inherited messy code. How did you decide what to fix first?
+[resume] Describe how you tested and rolled out a risky change.
+[general] Tell me about a time you disagreed with your manager.
+[general] Describe a time you missed a deadline. What happened?
+[general] Tell me about a conflict with a coworker and how you handled it.
+[general] Tell me about a time you failed.
+[general] Describe a time you received critical feedback. What did you do with it?
+[general] Tell me about a time you had to make a decision without enough data.
+[general] Tell me about a time you went beyond what was asked of you.
+[general] Describe a time you had to say no to a request.
+[general] Tell me about a time you disagreed with a decision but committed to it anyway.
+[general] Tell me about a time you helped a teammate grow or improve.
+[general] Describe a time requirements changed late in a project.
+[general] Tell me about a time you had to juggle several priorities at once.
+[general] Tell me about a time you made a mistake that affected other people.
+[general] Describe a time you pushed back on a product or design decision.
+[general] Tell me about a time you had to persuade others to adopt your idea.
+[general] Why do you want to work here, and why now?
